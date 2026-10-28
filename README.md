@@ -1,16 +1,37 @@
 # SmartService
 
-SmartService is a Python-only AI customer service demo. It includes real knowledge ingestion and embeddings, ACL-aware RAG, knowledge document management, order queries, confirmed/idempotent simulated refund applications, and smolagents tool orchestration with structured confirmation state.
+SmartService is a Python AI customer service demo built around two paths: evidence-based knowledge Q&A and an order/refund Agent. It connects FastAPI, PostgreSQL/pgvector, real Embedding calls, an OpenAI-compatible chat model, and smolagents. Refunds are simulated; no payment provider is called.
 
-See the [stage 1 implementation record](docs/STAGE1_IMPLEMENTATION.md) for the current architecture, SQLAlchemy usage, verification results, and remaining database checks.
+## What this project demonstrates
 
-See the [stage 2 knowledge ingestion record](docs/STAGE2_KNOWLEDGE_INGESTION.md) for the RAG ingestion flow, chunk metadata, ACL design, production concerns, and interview explanation.
+- **RAG:** upload Markdown/TXT documents, split and embed them, filter retrieval by document ACL in PostgreSQL, and return answers with source references or an explicit refusal when evidence is missing.
+- **Tool-using Agent:** query orders, check refund eligibility, and search policy documents. In `refund_policy` mode, the server verifies required tool evidence, order consistency, and a policy citation before accepting a prepared action.
+- **Controlled write:** the model can prepare a simulated refund, but only an explicit client confirmation causes the business service to create an application. The service applies business rules and an idempotency key.
+- **Quality checks:** 30 curated RAG/Agent cases, retrieval and tool-call checks, human fact review, feedback capture, and a lightweight retrieval-threshold experiment. These checks expose failures; they do not establish production quality.
 
-See the [stage 3 RAG implementation record](docs/STAGE3_RAG_IMPLEMENTATION.md) for ACL-aware vector retrieval, grounded GLM answers, Docker startup responsibilities, and real verification results.
+### Architecture
 
-See the [stage 4 business API record](docs/STAGE4_BUSINESS_APIS.md) for refund rules, confirmation and idempotency boundaries, database constraints, demo data, and verification results.
+```text
+Client -> FastAPI (app/api)
+             |-- /chat -> RAG (app/ai/rag.py) -> Embedding API
+             |                   |              -> PostgreSQL/pgvector (ai schema)
+             |                   +-> chat model -> answer + sources
+             |-- /agent/chat -> smolagents (app/ai/agent.py)
+             |                      |-> knowledge search
+             |                      |-> order/refund tools -> app/biz -> PostgreSQL (biz schema)
+             |                      +-> evidence check -> pending action
+             +-- explicit confirmation -> app/biz/refunds.py -> simulated application
+```
 
-See the [stage 5 Agent tools record](docs/STAGE5_AGENT_TOOLS.md) for smolagents tool binding, GLM tool calling, identity boundaries, structured confirmation, and current MVP limitations.
+The API, AI orchestration, business rules, and database access live in separate modules. The model can query data and prepare a pending action; the service binds caller-provided user context to business queries, enforces refund rules, and performs the final database write. The optional LangChain order demo (`app/ai/langchain_order_demo.py`) is a separate CLI exercise and does not replace the smolagents API.
+
+### Current validation and limits
+
+- With the optional LangChain demo dependencies installed, the local automated suite passes **97 tests** with **4 skipped**; the default run uses no external model or PostgreSQL. An earlier real run completed knowledge upload, Embedding, retrieval, Q&A, and a simulated refund prepare/confirm flow.
+- A 20-case RAG subset passed a real-model run with project-level human review. The **full 30-case Agent quality gate has not passed**: multi-tool tasks have intermittently missed required calls or citations and encountered provider errors. A successful single run is not a stability claim.
+- This is a local MVP. Request `user_id`/roles are not backed by login; conversation state is process-local. There is no production rate limiting, circuit breaker, persistent Agent trace, MCP server, or real payment refund.
+
+Start with [Local setup](#local-setup), then use the [API examples](#api-development-workflow) and [test commands](#tests). The public repository keeps implementation notes in this README; local development notes under `docs/` are intentionally excluded from Git.
 
 ## Local setup
 
@@ -47,6 +68,22 @@ After installing Docker Desktop, restart VS Code (or open a fresh PowerShell fro
 6. Open `http://127.0.0.1:8000/docs`. `GET /health` checks the API process; `GET /health/db` checks the PostgreSQL connection, pgvector extension, and required tables.
 
 The SQL in `db/init/` runs only when the PostgreSQL data volume is created for the first time. `docker compose down` stops the database without deleting its data.
+
+## Optional LangChain order demo
+
+Install the small LangChain exercise in the project virtual environment:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m pip install -e ".[langchain-demo]"
+```
+
+With the existing database and configured chat model available, run:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m app.ai.langchain_order_demo --user-id demo-user --order-id demo-refundable
+```
+
+The command uses LangChain `create_agent` and one `order_query` tool backed by `app.biz.orders.get_order`. It prints the answer and tool result for inspection. It only reads orders and does not create refund applications. `--user-id` is a local demo input, not a verified login identity. The normal `/api/v1/agent/chat` API continues to use smolagents. No new API route is registered.
 
 For an existing database volume, apply the feedback migrations from the project root (they are safe to rerun):
 
@@ -149,11 +186,14 @@ $body = @{
   roles = @("support")
   task_mode = "refund_policy"
 } | ConvertTo-Json
-Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/agent/chat" `
+$agentResult = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/agent/chat" `
   -Method Post -ContentType "application/json" -Body $body
+
+$agentResult | Select-Object answer, conversation_id, pending_action
+$agentResult.tool_calls | Select-Object tool_name, arguments, result
 ```
 
-This mode checks for successful policy search, order lookup, eligibility lookup, matching order IDs, and a policy citation before accepting a prepared refund action. Missing evidence or failed tools return a human-review message with no new pending action. This is a structural guard, not a guarantee that every generated policy claim is factually correct. The MVP still trusts caller-provided identity fields and stores conversation context only in one process.
+Inspect the returned `answer`, `conversation_id`, `tool_calls`, and `pending_action`; the exact answer and tool sequence depend on the model and available evidence. This mode checks for successful policy search, order lookup, eligibility lookup, matching order IDs, and a policy citation before accepting a prepared refund action. Missing evidence or failed tools return a human-review message with no new pending action. This is a structural guard, not a guarantee that every generated policy claim is factually correct. The MVP still trusts caller-provided identity fields and stores conversation context only in one process.
 
 Creating a simulated refund requires `confirmed=true` and a stable, client-generated idempotency key. Repeating the same request returns the same refund application:
 
@@ -285,9 +325,9 @@ Use `\q` to leave `psql`. The vector column is intentionally omitted from the sa
 
 ## Offline evaluation
 
-Successful RAG responses include `request_id`. To opt into the retrieval threshold experiment, send `"experiment": "threshold_v1"` in the chat request; the response includes variant A/B and its effective threshold. Variant assignment is stable per tenant and user, so this is a small demonstration experiment rather than a production A/B platform. Submit explicit feedback with `POST /api/v1/chat/feedback` using that `request_id`, `tenant_id`, `user_id`, and `rating` (`helpful` or `unhelpful`). Include `question` only when the user agrees to store the original text for later labeling. See [API contracts](docs/API_CONTRACTS.md). The MVP user ID is not authenticated.
+Successful RAG responses include `request_id`. To opt into the retrieval threshold experiment, send `"experiment": "threshold_v1"` in the chat request; the response includes variant A/B and its effective threshold. Variant assignment is stable per tenant and user, so this is a small demonstration experiment rather than a production A/B platform. Submit explicit feedback with `POST /api/v1/chat/feedback` using that `request_id`, `tenant_id`, `user_id`, and `rating` (`helpful` or `unhelpful`). Include `question` only when the user agrees to store the original text for later labeling. The request and response schemas are defined in [the API modules](app/api). The MVP user ID is not authenticated.
 
-The 30 curated cases are in `evals/cases/smartservice.jsonl`. The score report checks source recall, citations, refusals, tool names and arguments, and pending actions. Answer factuality still needs human review using each case's `review_notes`. See [evaluation guide](docs/EVALUATION.md).
+The 30 curated cases are in [evals/cases/smartservice.jsonl](evals/cases/smartservice.jsonl). The [evaluation runner](app/evals/runner.py) checks source recall, citations, refusals, tool names and arguments, and pending actions. Answer factuality still needs human review using each case's `review_notes`; [gate.py](app/evals/gate.py) combines structural checks and human decisions.
 
 Before a live RAG run, upload the three fixture documents once as private documents for `demo/demo-user` with role `support`. The current demo database may already contain `refund_policy.md`; list documents before uploading to avoid duplicate copies.
 
